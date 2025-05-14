@@ -1,0 +1,80 @@
+import torch
+import re
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from datasets import Dataset
+from peft import LoraConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainingArguments
+from trl import SFTTrainer
+
+def md_to_parquet(md_path: str, parquet_path: str):
+    with open(md_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    user_queries = re.findall(r"(?<=### User Query\s*\n)(.*?)(?=\n###|$)", content, re.DOTALL)
+    code_blocks = re.findall(r"(?<=### Code\s*\n)(.*?)(?=\n###|$)", content, re.DOTALL)
+    min_len = min(len(user_queries), len(code_blocks))
+
+    records = []
+    for i in range(min_len):
+        user_query = user_queries[i].strip()
+        code = code_blocks[i].strip()
+        full_text = f"### User Query:\n{user_query}\n\n### Code:\n{code}"
+        records.append({"text": full_text})
+
+    df = pd.DataFrame(records)
+    table = pa.Table.from_pandas(df)
+    pq.write_table(table, parquet_path)
+
+def load_parquet_dataset(parquet_file_path: str):
+    return Dataset.from_parquet(parquet_file_path)
+
+def finetune_llama_v2():
+    # Convert markdown to parquet
+    md_to_parquet("data.md", "processed_data.parquet")
+    data = load_parquet_dataset("processed_data.parquet")
+
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+    tokenizer.pad_token = tokenizer.eos_token
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype="float16", bnb_4bit_use_double_quant=True
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        "meta-llama/Llama-2-7b-hf", quantization_config=bnb_config, device_map={"": 0}
+    )
+    model.config.use_cache=False
+    model.config.pretraining_tp=1
+
+    peft_config = LoraConfig(
+        r=64, lora_alpha=32, lora_dropout=0.05, bias="none", task_type="CAUSAL_LM"
+    )
+    training_arguments = TrainingArguments(
+        output_dir="llama2_finetuned_chatbot",
+        per_device_train_batch_size=8,
+        gradient_accumulation_steps=4,
+        optim="paged_adamw_8bit",
+        learning_rate=2e-4,
+        lr_scheduler_type="linear",
+        save_strategy="epoch",
+        logging_steps=10,
+        num_train_epochs=1,
+        max_steps=10,
+        fp16=True,
+        push_to_hub=True
+    )
+    trainer = SFTTrainer(
+        model=model,
+        train_dataset=data,
+        peft_config=peft_config,
+        dataset_text_field="text",
+        args=training_arguments,
+        tokenizer=tokenizer,
+        packing=False,
+        max_seq_length=512
+    )
+    trainer.train()
+    trainer.push_to_hub()
+
+if __name__ == "__main__":
+    finetune_llama_v2()
