@@ -1,0 +1,76 @@
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, TrainingArguments
+from peft import LoraConfig, get_peft_model
+from trl import SFTTrainer
+from datasets import load_dataset
+from huggingface_hub import login
+from transformers.utils import logging
+logging.set_verbosity_info()
+login(token="Add token here")
+#model_name = "codellama/CodeLlama-7b-hf"
+#model_name="meta-llama/Llama-3.2-3B-Instruct"
+#model_name = "tiiuae/falcon-1b"
+model_name="tiiuae/falcon-rw-1b" 
+
+# === Load tokenizer ===
+tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+tokenizer.pad_token = tokenizer.eos_token  # Prevents warnings
+
+# === Load dataset ===
+dataset = load_dataset("json", data_files="openscenario2_template.json")["train"]
+
+# === Load model in 4-bit ===
+bnb_config = BitsAndBytesConfig(
+    load_in_8bit=True,
+    llm_int8_threshold=6.0,
+    llm_int8_skip_modules=None,
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    quantization_config=bnb_config,
+    device_map={"": 0},
+    trust_remote_code=True,
+    torch_dtype=torch.bfloat16,
+)
+
+# === Apply LoRA ===
+lora_config = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    target_modules=["query_key_value"],  # Adjust if needed for CodeLlama
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM"
+)
+
+model = get_peft_model(model, lora_config)
+
+# === Training args ===
+training_args = TrainingArguments(
+    output_dir="./results",
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=4,
+    num_train_epochs=1,
+    logging_dir="./logs",
+    save_steps=10,
+    save_total_limit=1,
+    bf16=True,
+    logging_steps=1,
+)
+
+# === Create Trainer ===
+trainer = SFTTrainer(
+    model=model,
+    train_dataset=dataset,
+    args=training_args,
+    packing=True,
+    max_seq_length=1024
+)
+
+# === Start training ===
+trainer.train()
+
+# === Save model ===
+trainer.model.save_pretrained("./finetuned-model")
+tokenizer.save_pretrained("./finetuned-model")
