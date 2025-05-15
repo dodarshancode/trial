@@ -1,0 +1,310 @@
+import os
+import json
+import pandas as pd
+import torch
+from datasets import Dataset
+from transformers import (
+    AutoModelForCausalLM, 
+    AutoTokenizer, 
+    TrainingArguments,
+    DataCollatorForLanguageModeling
+)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from trl import SFTTrainer
+from transformers import BitsAndBytesConfig
+
+# Configuration
+#MODEL_NAME = "tiiuae/falcon-1b"  # or any other small instruct-tuned model
+MODEL_NAME = "codellama/CodeLlama-7b-hf"  # Base model to fine-tune
+#tokenizer = AutoTokenizer.from_pretrained("codellama/CodeLlama-7b-hf")
+OUTPUT_DIR = "openscenario2-generator"
+LORA_DIR = f"{OUTPUT_DIR}/lora-weights"
+MAX_LENGTH = 4096  # Maximum sequence length
+LORA_R = 16        # LoRA rank
+LEARNING_RATE = 2e-5
+NUM_EPOCHS = 1
+BATCH_SIZE = 1     # Increase if your GPU has enough memory
+GRADIENT_ACCUMULATION_STEPS = 4
+USE_8BIT = True    # Set to True for memory efficiency
+DATASET_PATH = "openscenario2_template.json"
+
+print("Starting OpenSCENARIO 2 fine-tuning process...")
+
+# 1. Prepare the dataset
+def load_and_prepare_data(file_path):
+    """
+    Load the OpenSCENARIO 2 dataset and format it for training.
+    Expected JSON structure:
+    [
+        {
+            "query": "User query text",
+            "actors": ["actor1", "actor2", ...],
+            "map_info": "Map information",
+            "code": "OpenSCENARIO 2 code"
+        },
+        ...
+    ]
+    """
+    print(f"Loading dataset from {file_path}")
+    
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Dataset file not found at {file_path}")
+    
+    with open(file_path, 'r') as f:
+        data = json.load(f)
+    
+    # Format data for training
+    formatted_data = []
+    for item in data:
+        # Create a structured prompt
+        prompt = f"""[TASK] Generate OpenSCENARIO 2 code for the following scenario:
+
+[USER_QUERY]
+{item['query']}
+
+[ACTORS]
+{', '.join(item['actors'])}
+
+[MAP_INFO]
+{item['map_info']}
+
+[OUTPUT]
+"""
+        # The expected completion is the code
+        completion = item['code']
+        
+        # Create a formatted sample with prompt and completion
+        formatted_sample = {
+            "prompt": prompt,
+            "completion": completion,
+            "text": f"{prompt}{completion}"  # Combined for training
+        }
+        formatted_data.append(formatted_sample)
+    
+    print(f"Prepared {len(formatted_data)} training examples")
+    return formatted_data
+
+# 2. Create HF Dataset
+def create_dataset(formatted_data):
+    """Convert the formatted data to a HuggingFace Dataset."""
+    df = pd.DataFrame(formatted_data)
+    dataset = Dataset.from_pandas(df)
+    print("Dataset created successfully")
+    return dataset
+
+# 3. Set up tokenizer
+def setup_tokenizer(model_name):
+    """Set up and configure the tokenizer."""
+    print(f"Setting up tokenizer for {model_name}")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    
+    # Ensure the tokenizer has padding and EOS token
+    tokenizer.pad_token = tokenizer.eos_token
+    
+    # Add special tokens for our prompt format if needed
+    special_tokens = {
+        "additional_special_tokens": [
+            "[TASK]", "[USER_QUERY]", "[ACTORS]", "[MAP_INFO]", "[OUTPUT]"
+        ]
+    }
+    tokenizer.add_special_tokens(special_tokens)
+    
+    return tokenizer
+
+# 4. Set up model with LoRA for efficient fine-tuning
+def setup_model(model_name, tokenizer):
+    """Set up the model with LoRA configuration for efficient fine-tuning."""
+    print(f"Loading model: {model_name}")
+    
+    # Define quantization config (8-bit)
+    quant_config = BitsAndBytesConfig(
+        load_in_8bit=True,
+        llm_int8_threshold=6.0,
+        llm_int8_enable_fp32_cpu_offload=True  # Enable CPU offloading
+    )
+
+    # Load model with quantization config
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        quantization_config=quant_config,
+        device_map="auto",
+        torch_dtype=torch.float16,
+    )
+    
+    # Prepare for k-bit training
+    model = prepare_model_for_kbit_training(model)
+
+    # Define LoRA config
+    lora_config = LoraConfig(
+        r=LORA_R,
+        lora_alpha=32,
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM"
+    )
+
+    # Apply LoRA
+    model = get_peft_model(model, lora_config)
+
+    # Resize embeddings with memory-efficient method
+    model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
+
+    print(f"Model set up complete with {model.num_parameters()} parameters")
+    #print(f"Trainable parameters: {model.num_parameters(trainable=True)}")
+
+    return model
+
+# 5. Training function
+def train_model(model, tokenizer, dataset):
+    """Train the model using SFTTrainer."""
+    print("Setting up training arguments")
+    
+    # Set up training arguments
+    training_args = TrainingArguments(
+        output_dir=OUTPUT_DIR,
+        per_device_train_batch_size=BATCH_SIZE,
+        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+        learning_rate=LEARNING_RATE,
+        num_train_epochs=NUM_EPOCHS,
+        logging_steps=5,
+        save_steps=25,
+        save_total_limit=3,
+        fp16=True,
+        remove_unused_columns=False,
+        report_to="tensorboard",
+    )
+    
+    # Configure the data collator
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer, 
+        mlm=False
+    )
+    
+    # Define preprocessing function
+    def preprocess_function(examples):
+        return tokenizer(
+            examples["text"],
+            truncation=True,
+            max_length=MAX_LENGTH,
+            padding="max_length",
+        )
+    
+    # Preprocess the dataset
+    tokenized_dataset = dataset.map(
+        preprocess_function,
+        batched=True,
+        remove_columns=dataset.column_names,
+    )
+    
+    # Create trainer
+    trainer = SFTTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_dataset,
+        data_collator=data_collator
+    )
+    
+    print("Starting training")
+    trainer.train()
+    
+    # Save the final model
+    print(f"Saving final model to {LORA_DIR}")
+    model.save_pretrained(LORA_DIR)
+    tokenizer.save_pretrained(LORA_DIR)
+    
+    return model, tokenizer
+
+# 6. Function to export model for Ollama
+def export_to_ollama(model_name="openscenario2"):
+    """Create Ollama modelfile and instructions for importing the model."""
+    print("Creating Ollama modelfile")
+    
+    modelfile_content = f"""FROM codellama:34b
+PARAMETER temperature 0.2
+PARAMETER top_p 0.95
+PARAMETER top_k 40
+PARAMETER stop "[STOP]"
+PARAMETER stop "```"
+SYSTEM You are an OpenSCENARIO 2 code generator specialized in creating complete and valid OpenSCENARIO 2 code files from scenario descriptions.
+"""
+    
+    # Write modelfile
+    with open("openscenario2.modelfile", "w") as f:
+        f.write(modelfile_content)
+    
+    print("\nTo use your fine-tuned model with Ollama, run these commands:")
+    print("1. Create the base model:")
+    print(f"   ollama create {model_name} -f openscenario2.modelfile")
+    print("\n2. Import your fine-tuned weights (use the appropriate method for your setup)")
+    print("   For PEFT/LoRA weights, you'll need to merge them with the base model first.")
+    
+    return True
+
+# 7. Optional: Test generation function
+def test_generation(tokenizer, model, test_prompt):
+    """Test the fine-tuned model with a prompt."""
+    inputs = tokenizer(test_prompt, return_tensors="pt").to(model.device)
+    
+    outputs = model.generate(
+        inputs["input_ids"],
+        max_length=2048,
+        temperature=0.2,
+        top_p=0.95,
+        do_sample=True,
+    )
+    
+    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return generated_text
+
+# Main execution
+def main():
+    """Main execution function."""
+    print("GPU availability:", torch.cuda.is_available())
+    if torch.cuda.is_available():
+        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    
+    # Create directories
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(LORA_DIR, exist_ok=True)
+    
+    # Load and prepare data
+    formatted_data = load_and_prepare_data(DATASET_PATH)
+    dataset = create_dataset(formatted_data)
+    
+    # Setup tokenizer and model
+    tokenizer = setup_tokenizer(MODEL_NAME)
+    model = setup_model(MODEL_NAME, tokenizer)
+    
+    # Train the model
+    model, tokenizer = train_model(model, tokenizer, dataset)
+    
+    # Export to Ollama
+    export_to_ollama()
+    
+    print("Fine-tuning complete! You can now use your model with Ollama.")
+    
+    # Test the model with a sample prompt (optional)
+    test_prompt = """[TASK] Generate OpenSCENARIO 2 code for the following scenario:
+
+[USER_QUERY]
+Create a scenario where a car performs an emergency brake to avoid a pedestrian crossing the road
+
+[ACTORS]
+car, pedestrian
+
+[MAP_INFO]
+Urban intersection with crosswalk
+
+[OUTPUT]
+"""
+    
+    print("\n--- Sample Generation Test ---")
+    print("Prompt:")
+    print(test_prompt)
+    print("\nGenerated Code:")
+    generated_code = test_generation(tokenizer, model, test_prompt)
+    print(generated_code)
+
+if __name__ == "__main__":
+    main()
