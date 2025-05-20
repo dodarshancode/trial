@@ -1,0 +1,57 @@
+import re
+import pandas as pd
+
+def parse_markdown(md_text, max_level=2):
+    """
+    Parse markdown text and extract headings up to `max_level` and their content.
+    Returns a DataFrame with columns for each heading level and the associated content.
+    """
+    lines = md_text.splitlines()
+    records = []
+    # Prepare placeholders for heading levels and content buffer
+    current = {f'level_{i}': None for i in range(1, max_level+1)}
+    current['content'] = []
+    
+    def push_record():
+        # Only push if there's content
+        if current['content']:
+            record = {lvl: current[lvl] for lvl in current if lvl != 'content'}
+            record['content'] = '\n'.join(current['content']).strip()
+            records.append(record)
+    
+    for line in lines:
+        # Check if line is a heading up to the desired level
+        heading_match = re.match(r'^(#{1,' + str(max_level) + r'})\s+(.*)', line)
+        if heading_match:
+            # Save the previous section
+            push_record()
+            level = len(heading_match.group(1))
+            text = heading_match.group(2).strip()
+            # Clear any deeper headings when a higher heading appears
+            for lvl in range(level+1, max_level+1):
+                current[f'level_{lvl}'] = None
+            current['content'] = []
+            # Store this heading text
+            current[f'level_{level}'] = text
+        else:
+            # Regular content (including code blocks)
+            current['content'].append(line)
+    
+    # Push the last section
+    push_record()
+    
+    # Build DataFrame
+    df = pd.DataFrame(records)
+    return df
+
+# --- Example usage ---
+sample_md = """
+# Introduction
+This is the introduction section.
+It has multiple lines of text.
+
+## Details
+Here are some details:
+```python
+def hello_world():
+    print("Hello, world!")
