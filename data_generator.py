@@ -71,3 +71,22 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+######
+'''
+# User query:
+"Generate a {model} completion with temperature {temperature}"
+
+---
+# Code to run:
+import openai
+openai.api_key = "YOUR_KEY"
+openai.ChatCompletion.create(
+    model="{model}",
+    messages=[{"role":"user","content":"Hello!"}],
+    temperature={temperature}
+)
+'''
+
+python render_templates.py template.txt output.csv
